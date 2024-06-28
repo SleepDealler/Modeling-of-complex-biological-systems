@@ -1,0 +1,493 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+
+If the 16S_RNA_Data folder is not present in the main directory, please skip executing lines 38-117. The data for this section has been deposited via https://drive.google.com/drive/folders/1DJBZgh1okghMvzrJ8uRDDggWbjUeG8Mr?usp=sharing
+
+```{r}
+#Installing required libraries
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+library(dada2)
+library(ShortRead)
+library(Biostrings)
+library(tidyverse)
+library(phyloseq)
+library(vegan)
+library(ggplot2)
+library(tidyr)
+library(edgeR)
+library(limma)
+library(GenomicFeatures)
+library(BiocGenerics)
+library(SummarizedExperiment)
+library(pheatmap)
+library(ggfortify)
+library(DESeq2)
+library(corrplot)
+library(randomForest)
+library(caret)
+library(scales)
+```
+
+1. 16S rRNA analysis
+
+```{r}
+# Loading all samples
+path <- "./16S_RNA_Data/row_data"
+fnFs <- sort(list.files(path, pattern="_1.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_2.fastq.gz", full.names = TRUE))
+
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+filtFs <- file.path(path, "../filtered", paste0(sample.names, "_F_filt.fastq"))
+filtRs <- file.path(path, "../filtered", paste0(sample.names, "_R_filt.fastq"))
+
+# Filtration and cutting
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(240,160),
+                     maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                     compress=TRUE, multithread=TRUE)
+```
+
+```{r}
+# Learning errors
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+```
+
+```{r}
+# Dereplication
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+
+# Clastering
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+```
+
+```{r}
+# Merging reads
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+
+# Constructing OTU table
+seqtab <- makeSequenceTable(mergers)
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+```
+
+```{r}
+# Assigning taxonomy
+reference_db <- file.path(path, "../silva_nr99_v138.1_wSpecies_train_set.fa.gz")
+taxa <- assignTaxonomy(seqtab.nochim, reference_db, multithread=TRUE)
+
+```
+
+```{r}
+write.csv(seqtab.nochim, file.path("./Results/otu_table.csv"))
+write.csv(taxa, file.path("./Results/taxonomy_table.csv"))
+```
+
+```{r}
+otu_file <- "./Results/otu_table.csv"
+taxonomy_file <- "./Results/taxonomy_table.csv"
+otu_table <- read.csv(otu_file, row.names = 1, check.names = FALSE)
+
+# Transposition of the OTU table
+otu_table_transposed <- as.data.frame(t(otu_table))
+
+taxonomy_table <- read.csv(taxonomy_file, row.names = 1, check.names = FALSE)
+```
+
+```{r}
+# Filtering
+common_indices <- intersect(rownames(otu_table_transposed), rownames(taxonomy_table))
+otu_table_filtered <- otu_table_transposed[common_indices, ]
+taxonomy_table_filtered <- taxonomy_table[common_indices, ]
+```
+
+```{r}
+# Converting to phyloseq format
+otu_table_ps <- otu_table(as.matrix(otu_table_filtered), taxa_are_rows = TRUE)
+taxonomy_table_ps <- tax_table(as.matrix(taxonomy_table_filtered))
+physeq <- phyloseq(otu_table_ps, taxonomy_table_ps)
+saveRDS(physeq, file = "./Results/phyloseq_object.rds")
+```
+
+```{r}
+# Figure 1: Alpha diversity
+
+physeq <- readRDS("./Results/phyloseq_object.rds")
+alpha_diversity <- estimate_richness(physeq)
+alpha_diversity_filtered <- alpha_diversity[alpha_diversity$Shannon != 0, ]
+
+alpha_diversity_long <- gather(alpha_diversity_filtered, key = "Measure", value = "Value", Shannon, Simpson, InvSimpson)
+
+p <- ggplot(alpha_diversity_long, aes(x = Measure, y = Value, fill = Measure)) +
+  geom_violin() +
+  geom_jitter(width = 0.2, size = 1) +
+  ggtitle("Alpha Diversity Measures") +
+  xlab("Diversity Measure") +
+  ylab("Value") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(p)
+
+ggsave("./Final_presentation/OTU_1.png", plot = p, width = 10, height = 6, dpi = 300, bg = "white")
+
+```
+
+```{r}
+# Figure 2: Beta diversity
+physeq <- prune_samples(sample_sums(physeq) > 0, physeq)
+
+ordination <- ordinate(physeq, method = "NMDS", distance = "bray")
+
+nmds_plot <- plot_ordination(physeq, ordination, type = "samples") +
+  geom_point(size = 3, aes(color = factor(sample_names(physeq)))) +
+  ggtitle("Bray-Curtis Distance") +
+  theme_minimal() + 
+  labs(color = "Sample") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(nmds_plot)
+ggsave("./Final_presentation/OTU_2.png", plot = nmds_plot, width = 10, height = 6, dpi = 300, bg = "white")
+```
+
+```{r}
+# Figure 3: Phylum level abundance
+phylum_level <- tax_glom(physeq, taxrank = "Phylum")
+phylum_abundance <- psmelt(phylum_level)
+
+phylum_abundance_filtered <- phylum_abundance %>%
+  group_by(Sample) %>%
+  filter(sum(Abundance) > 0) %>%
+  ungroup()
+
+phylium_plot <- ggplot(phylum_abundance_filtered, aes(x = Sample, y = Abundance, fill = Phylum)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ggtitle("Phylum Level Abundance") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(phylium_plot)
+ggsave("./Final_presentation/OTU_3.png", plot = phylium_plot, width = 10, height = 6, dpi = 300, bg = "white")
+```
+
+```{r}
+# Figure 4: Genus level abundance
+genus_level <- tax_glom(physeq, taxrank = "Genus")
+genus_abundance <- psmelt(genus_level)
+
+genus_abundance_filtered <- genus_abundance %>%
+  group_by(Sample) %>%
+  filter(sum(Abundance) > 0) %>%
+  ungroup()
+
+genus_plot <- ggplot(genus_abundance_filtered, aes(x = Sample, y = Abundance, fill = Genus)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  ggtitle("Genus Level Abundance") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(genus_plot)
+ggsave("./Final_presentation/OTU_4.png", plot = genus_plot, width = 10, height = 6, dpi = 300, bg = "white")
+
+```
+
+2. RNA-seq analysis
+
+```{r}
+# Loading samples after FeatureCounts
+count_data <- read.delim(unz("./Results/counts.zip", "counts.txt"), comment = "#")
+
+rownames(count_data) <- count_data$Geneid
+count_data <- count_data[, -c(1:6)]
+
+```
+
+```{r}
+group <- factor(c(rep("tumor", 10), rep("adjacent", 10)))
+y <- DGEList(counts=count_data, group=group)
+y <- calcNormFactors(y)
+```
+
+```{r}
+# Differential expression analysis
+design <- model.matrix(~ group)
+colnames(design) <- levels(group)
+
+y <- estimateDisp(y, design)
+fit <- glmQLFit(y, design)
+qlf <- glmQLFTest(fit, coef=2)
+
+res <- topTags(qlf, n=Inf)
+write.csv(res, file="./Results/differential_expression_results.csv")
+```
+
+
+```{r}
+# Significant genes filtering
+signif_genes <- res$table[res$table$FDR < 0.05 & abs(res$table$logFC) > 0.8, ]
+write.csv(signif_genes, file="./Results/significant_differentially_expressed_genes.csv")
+```
+
+```{r}
+signif_gene_ids <- rownames(signif_genes)
+signif_counts <- count_data[signif_gene_ids, ]
+
+write.csv(signif_counts, file="./Results/significant_counts.csv", row.names=TRUE)
+```
+
+```{r}
+# Figure 5: Histogram of log2FC for all genes
+
+full_histogram <- ggplot(res$table, aes(x=logFC)) +
+  geom_histogram(binwidth=0.1, fill="blue", color="black", alpha=0.7) +
+  theme_minimal() +
+  labs(title="Histogram of log2 Fold Changes", x="log2 Fold Change", y="Frequency") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(full_histogram)
+ggsave("./Final_presentation/signif_1.png", plot = full_histogram, width = 10, height = 6, dpi = 300, bg = "white")
+```
+
+```{r}
+# Figure 8: Volcanoplot for all genes
+full_volcano <- ggplot(res$table, aes(x=logFC, y=-log10(FDR))) +
+  geom_point(alpha=0.4, size=1.75) +
+  theme_minimal() +
+  labs(title="Volcano Plot for all genes", x="log2 Fold Change", y="-log10 Adjusted p-value") +
+  geom_hline(yintercept = -log10(0.05), linetype="dashed", color="red") +
+  geom_vline(xintercept = c(-0.8, 0.8), linetype="dashed", color="blue") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(full_volcano)
+ggsave("./Final_presentation/signif_2.png", plot = full_volcano, width = 10, height = 6, dpi = 300, bg = "white")
+```
+
+```{r}
+# Figure 7: Histogram of log2FC for significant genes
+filtered_histogram <- ggplot(signif_genes, aes(x=logFC)) +
+  geom_histogram(binwidth=0.1, fill="blue", color="black", alpha=0.7) +
+  theme_minimal() +
+  labs(title="Histogram of log2 Fold Changes for Significant Genes", x="log2 Fold Change", y="Frequency") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(filtered_histogram)
+ggsave("./Final_presentation/signif_3.png", plot = filtered_histogram, width = 10, height = 6, dpi = 300, bg = "white")
+```
+
+```{r}
+filtered_volcano <- ggplot(signif_genes, aes(x=logFC, y=-log10(FDR))) +
+  geom_point(alpha=0.4, size=1.75) +
+  theme_minimal() +
+  labs(title="Volcano Plot for Significant Genes", x="log2 Fold Change", y="-log10 Adjusted p-value") +
+  geom_hline(yintercept = -log10(0.05), linetype="dashed", color="red") +
+  geom_vline(xintercept = c(-0.8, 0.8), linetype="dashed", color="blue") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+print(filtered_volcano)
+ggsave("./Final_presentation/signif_4.png", plot = filtered_volcano, width = 10, height = 6, dpi = 300, bg = "white")
+
+```
+
+```{r}
+# Figure 8: Correlation of 50 most significant genes
+top_genes <- head(rownames(signif_genes), 50)
+
+selected_expr <- y$counts[top_genes, ]
+
+logcpm <- cpm(selected_expr, log=TRUE)
+
+colnames(logcpm) <- gsub("_sorted.bam", "", colnames(logcpm))
+colnames(logcpm) <- gsub("output_", "", colnames(logcpm))
+colnames(logcpm) <- ifelse(grepl("adj", colnames(logcpm)), 
+                           paste("Control", gsub("_adj", "", gsub("adj_", "", colnames(logcpm))), sep="_"), 
+                           paste("Tumor", colnames(logcpm), sep="_"))
+
+
+pheatmap(logcpm, cluster_rows=TRUE, cluster_cols=TRUE, 
+         show_rownames=TRUE, show_colnames=TRUE, 
+         main="Heatmap of Significant Differentially Expressed Genes",
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(50),
+         fontsize_row = 5, fontsize_col = 8)
+```
+
+3. Correlation and model creating
+
+```{r}
+signif_genes <- signif_counts
+
+tumor_samples <- signif_genes[, grepl("output_\\d+_sorted.bam", colnames(signif_genes))]
+control_samples <- signif_genes[, grepl("output_\\d+_adj_sorted.bam", colnames(signif_genes))]
+
+colnames(tumor_samples) <- gsub("output_(\\d+)_sorted.bam", "Sample_\\1", colnames(tumor_samples))
+colnames(control_samples) <- gsub("output_(\\d+)_adj_sorted.bam", "Sample_\\1", colnames(control_samples))
+```
+
+```{r}
+physeq <- readRDS("./Results/phyloseq_object.rds")
+
+otu_table <- as.data.frame(otu_table(physeq))
+
+otu_table <- otu_table[, -c(2, 4, 5)]
+
+colnames(otu_table) <- paste0("Sample_", seq_len(ncol(otu_table)))
+
+otu_table <- otu_table[, 1:10]
+```
+
+```{r}
+# Data synchronization and normalization
+common_samples <- intersect(colnames(tumor_samples), colnames(otu_table))
+
+tumor_samples_filtered <- tumor_samples[, common_samples, drop=FALSE]
+otu_table_filtered <- otu_table[, common_samples, drop=FALSE]
+
+tumor_samples_filtered[] <- lapply(tumor_samples_filtered, as.numeric)
+
+dds_tumor <- DESeqDataSetFromMatrix(countData = tumor_samples_filtered, colData = data.frame(condition=rep("tumor", ncol(tumor_samples_filtered))), design = ~ 1)
+dds_tumor <- estimateSizeFactors(dds_tumor)
+norm_counts_tumor <- counts(dds_tumor, normalized=TRUE)
+
+norm_counts_tumor <- norm_counts_tumor[1:64, ]
+otu_table_filtered <- otu_table_filtered[1:64, ]
+```
+
+```{r}
+# Figure 9: Correlation analysis between OTU and DGE
+correlation_matrix_tumor <- matrix(NA, nrow=nrow(otu_table_filtered), ncol=nrow(norm_counts_tumor))
+rownames(correlation_matrix_tumor) <- rownames(otu_table_filtered)
+colnames(correlation_matrix_tumor) <- rownames(norm_counts_tumor)
+
+otu_table_filtered <- as.matrix(otu_table_filtered)
+norm_counts_tumor <- as.matrix(norm_counts_tumor)
+
+
+for (i in 1:nrow(otu_table_filtered)) {
+  for (j in 1:nrow(norm_counts_tumor)) {
+    correlation_matrix_tumor[i, j] <- cor(otu_table_filtered[i, ], norm_counts_tumor[j, ], method = "spearman")
+  }
+}
+
+correlation_matrix_tumor <- correlation_matrix_tumor[apply(correlation_matrix_tumor, 1, function(x) !any(is.na(x))), ]
+
+rownames(correlation_matrix_tumor) <- paste0("OTU_", seq_len(nrow(correlation_matrix_tumor)))
+colnames(correlation_matrix_tumor) <- paste0("Gene_", seq_len(ncol(correlation_matrix_tumor)))
+
+png("./Final_presentation/correlation_1.png", width = 1200, height = 1000, res = 150)
+
+corrplot(correlation_matrix_tumor, method = "color", tl.cex = 0.4, cl.cex = 0.5, title = "Correlation between OTUs and Differentially Expressed Genes (Tumor)", mar = c(0, 0, 2, 0))
+
+dev.off()
+
+corrplot(correlation_matrix_tumor, method = "color", tl.cex = 0.4, cl.cex = 0.5, title = "Correlation between OTUs and Differentially Expressed Genes (Tumor)", mar = c(0, 0, 2, 0))
+```
+
+```{r}
+# The same steps for control samples
+common_samples_control <- intersect(colnames(control_samples), colnames(otu_table))
+
+control_samples_filtered <- control_samples[, common_samples_control, drop=FALSE]
+otu_table_filtered_control <- otu_table[, common_samples_control, drop=FALSE]
+
+control_samples_filtered[] <- lapply(control_samples_filtered, as.numeric)
+
+dds_control <- DESeqDataSetFromMatrix(countData = control_samples_filtered, colData = data.frame(condition=rep("control", ncol(control_samples_filtered))), design = ~ 1)
+dds_control <- estimateSizeFactors(dds_control)
+norm_counts_control <- counts(dds_control, normalized=TRUE)
+
+norm_counts_control <- norm_counts_control[1:64, ]
+otu_table_filtered_control <- otu_table_filtered_control[1:64, ]
+```
+
+```{r}
+correlation_matrix_control <- matrix(NA, nrow=nrow(otu_table_filtered_control), ncol=nrow(norm_counts_control))
+rownames(correlation_matrix_control) <- rownames(otu_table_filtered_control)
+colnames(correlation_matrix_control) <- rownames(norm_counts_control)
+
+otu_table_filtered_control <- as.matrix(otu_table_filtered_control)
+norm_counts_control <- as.matrix(norm_counts_control)
+
+
+for (i in 1:nrow(otu_table_filtered_control)) {
+  for (j in 1:nrow(norm_counts_control)) {
+    correlation_matrix_control[i, j] <- cor(otu_table_filtered_control[i, ], norm_counts_control[j, ], method = "spearman")
+  }
+}
+
+correlation_matrix_control <- correlation_matrix_control[apply(correlation_matrix_control, 1, function(x) !any(is.na(x))), ]
+
+rownames(correlation_matrix_control) <- paste0("OTU_", seq_len(nrow(correlation_matrix_control)))
+colnames(correlation_matrix_control) <- paste0("Gene_", seq_len(ncol(correlation_matrix_control)))
+
+png("./Final_presentation/correlation_2.png", width = 1200, height = 1000, res = 150)
+
+corrplot(correlation_matrix_tumor, method = "color", tl.cex = 0.4, cl.cex = 0.5, title = "Correlation between OTUs and Differentially Expressed Genes (Control)", mar = c(0, 0, 2, 0))
+
+dev.off()
+
+corrplot(correlation_matrix_tumor, method = "color", tl.cex = 0.4, cl.cex = 0.5, title = "Correlation between OTUs and Differentially Expressed Genes (Control)", mar = c(0, 0, 2, 0))
+```
+
+
+```{r}
+# Model construction
+features_tumor <- as.data.frame(t(norm_counts_tumor))
+features_tumor$Label <- "Tumor"
+
+features_control <- as.data.frame(t(norm_counts_control))
+features_control$Label <- "Control"
+
+features <- rbind(features_tumor, features_control)
+
+x <- features[, -ncol(features)]
+y <- features$Label
+
+set.seed(12)
+trainIndex <- createDataPartition(y, p = 0.7, list = FALSE)
+x_train <- x[trainIndex, ]
+x_test <- x[-trainIndex, ]
+y_train <- y[trainIndex]
+y_test <- y[-trainIndex]
+```
+
+```{r}
+# Figure 10: Barplot variable importance
+set.seed(12)
+model_rf <- randomForest(x = x_train, y = as.factor(y_train), ntree = 500, mtry = sqrt(ncol(x_train)))
+
+predictions <- predict(model_rf, x_test)
+confusion_matrix <- confusionMatrix(predictions, as.factor(y_test))
+
+print(confusion_matrix)
+
+# Variable importance
+var_importance <- importance(model_rf)
+var_importance_df <- data.frame(Feature = rownames(var_importance), Importance = var_importance[, 1])
+var_importance_df <- var_importance_df[order(var_importance_df$Importance, decreasing = TRUE), ]
+
+var_importance_df$color <- ifelse(var_importance_df$Importance >= 0.05, "Statistically significant gene", "Statistically non-significant gene")
+
+p <- ggplot(var_importance_df, aes(x = reorder(Feature, Importance), y = Importance, fill = color)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  xlab("Features") +
+  ylab("Importance") +
+  ggtitle("Variable Importance in Random Forest Model") +
+  scale_fill_manual(values = c("Statistically significant gene" = muted("green"), "Statistically non-significant gene" = muted("red")), 
+                    name = "Gene Importance") +
+  theme(axis.text.y = element_text(size = 8)) +
+  theme(plot.title = element_text(hjust = 0.5, size = 16)) +
+  theme(axis.title.x = element_text(size = 14), axis.title.y = element_text(size = 14)) +
+  theme(legend.title = element_text(size = 12), legend.text = element_text(size = 10))
+
+print(p)
+
+ggsave("./Final_presentation/model.png", plot = p, width = 10, height = 10)
+
+```
